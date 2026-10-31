@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forex Scanner</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background:#0f1419; color:#e6e6e6; margin:0; padding:12px; }
+  h1 { font-size:20px; margin:4px 0 12px; }
+  .card { background:#1a2028; border-radius:10px; padding:12px; margin-bottom:12px; }
+  label { display:block; font-size:12px; color:#9aa5b1; margin-top:8px; }
+  input, select, button { width:100%; padding:10px; margin-top:4px; border-radius:8px; border:1px solid #2c3640; background:#0f1419; color:#e6e6e6; font-size:16px; box-sizing:border-box; }
+  button { background:#2e7d32; border:none; font-weight:bold; margin-top:12px; }
+  .buy { color:#4caf50; font-weight:bold; }
+  .sell { color:#ef5350; font-weight:bold; }
+  .muted { color:#9aa5b1; font-size:13px; }
+  .tag { font-size:11px; background:#2c3640; border-radius:6px; padding:2px 6px; margin-left:6px; }
+</style>
+</head>
+<body>
+<h1>Forex Scanner</h1>
+
+<div class="card">
+  <label>Twelve Data API key (free at twelvedata.com)</label>
+  <input id="key" placeholder="Paste your API key">
+  <label>Strategy</label>
+  <select id="mode">
+    <option value="both">Both strategies</option>
+    <option value="sr">Support/Resistance Bounce only</option>
+    <option value="sniper">Swing Sniper (trend pullback) only</option>
+  </select>
+  <label>Timeframe</label>
+  <select id="tf"><option value="1h">1 hour</option><option value="4h">4 hour</option></select>
+  <label>Account size ($)</label>
+  <input id="acct" type="number" value="1000">
+  <label>Risk per trade (%)</label>
+  <input id="risk" type="number" value="1" step="0.1">
+  <button onclick="scan()">Scan Pairs</button>
+</div>
+
+<div id="out"></div>
+
+<p class="muted">Educational tool only. Not financial advice. Test on a demo account first.</p>
+
+<script>
+const PAIRS = ["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD","USD/CHF","NZD/USD","EUR/GBP"];
+
+async function getCandles(pair, tf, key) {
+  const url = `https://api.twelvedata.com/time_series?symbol=${pair}&interval=${tf}&outputsize=200&apikey=${key}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (!j.values) throw new Error(j.message || "No data");
+  return j.values.reverse().map(v => ({ o:+v.open, h:+v.high, l:+v.low, c:+v.close }));
+}
+
+function ema(values, n) {
+  const k = 2/(n+1);
+  const out = [values[0]];
+  for (let i=1;i<values.length;i++) out.push(values[i]*k + out[i-1]*(1-k));
+  return out;
+}
+
+function adx(c, n=14) {
+  let tr=[], pdm=[], ndm=[];
+  for (let i=1;i<c.length;i++){
+    const up=c[i].h-c[i-1].h, dn=c[i-1].l-c[i].l;
+    pdm.push(up>dn&&up>0?up:0);
+    ndm.push(dn>up&&dn>0?dn:0);
+    tr.push(Math.max(c[i].h-c[i].l, Math.abs(c[i].h-c[i-1].c), Math.abs(c[i].l-c[i-1].c)));
+  }
+  const sm=(a)=>{ let s=a.slice(0,n).reduce((x,y)=>x+y,0); const o=[s]; for(let i=n;i<a.length;i++){ s=s-s/n+a[i]; o.push(s);} return o; };
+  const t=sm(tr), p=sm(pdm), m=sm(ndm);
+  const dx=t.map((x,i)=>{ const pi=100*p[i]/x, mi=100*m[i]/x; return 100*Math.abs(pi-mi)/(pi+mi||1); });
+  let a=dx.slice(0,n).reduce((x,y)=>x+y,0)/n;
+  for(let i=n;i<dx.length;i++) a=(a*(n-1)+dx[i])/n;
+  return a;
+}
+
+// Builds three take-profit levels from the entry and stop distance.
+// mults = risk-to-reward multiples, e.g. [1,2,3] means 1:1, 1:2, 1:3.
+function targets(side, entry, dist, mults) {
+  const dir = side==="BUY" ? 1 : -1;
+  return mults.map(m => entry + dir*m*dist);
+}
+
+// ---------- Strategy 1: Support/Resistance bounce (targets 1:1, 1:2, 1:3) ----------
+const SR_MULTS = [1,2,3];
+
+function findLevels(c) {
+  const swings=[];
+  for (let i=3;i<c.length-3;i++){
+    const hi=c.slice(i-3,i+4).every(x=>x.h<=c[i].h);
+    const lo=c.slice(i-3,i+4).every(x=>x.l>=c[i].l);
+    if(hi) swings.push(c[i].h);
+    if(lo) swings.push(c[i].l);
+  }
+  swings.sort((a,b)=>a-b);
+  const groups=[];
+  for(const s of swings){
+    const g=groups[groups.length-1];
+    if(g && Math.abs(s-g.avg)/g.avg<=0.0015){ g.vals.push(s); g.avg=g.vals.reduce((a,b)=>a+b,0)/g.vals.length; }
+    else groups.push({vals:[s],avg:s});
+  }
+  return groups.filter(g=>g.vals.length>=2).map(g=>g.avg);
+}
+
+function srSignal(c, riskAmt) {
+  const levels=findLevels(c);
+  const k=c[c.length-1];
+  const body=Math.abs(k.c-k.o);
+  const lowWick=Math.min(k.o,k.c)-k.l;
+  const upWick=k.h-Math.max(k.o,k.c);
+  for(const lv of levels){
+    if(Math.abs(k.l-lv)/lv<=0.001 && k.c>k.o && lowWick>=body){
+      const entry=k.c, stop=lv*(1-0.002), dist=entry-stop;
+      return {side:"BUY",entry,stop,tps:targets("BUY",entry,dist,SR_MULTS),rrs:["1:1","1:2","1:3"],note:"Bounce off support "+lv.toFixed(5),units:riskAmt/dist};
+    }
+    if(Math.abs(k.h-lv)/lv<=0.001 && k.c<k.o && upWick>=body){
+      const entry=k.c, stop=lv*(1+0.002), dist=stop-entry;
+      return {side:"SELL",entry,stop,tps:targets("SELL",entry,dist,SR_MULTS),rrs:["1:1","1:2","1:3"],note:"Rejection at resistance "+lv.toFixed(5),units:riskAmt/dist};
+    }
+  }
+  return null;
+}
+
+// ---------- Strategy 2: Swing Sniper (targets 1:2, 1:3, 1:5) ----------
+const SNIPER_MULTS = [2,3,5];
+
+function sniperSignal(c, riskAmt) {
+  const closes=c.map(x=>x.c);
+  const e20=ema(closes,20), e50=ema(closes,50);
+  const i=c.length-1;
+  const k=c[i];
+  const slope50=e50[i]-e50[i-5];
+  const body=Math.abs(k.c-k.o);
+  const lowWick=Math.min(k.o,k.c)-k.l;
+  const upWick=k.h-Math.max(k.o,k.c);
+  const near=(price)=>Math.abs(price-e50[i])/e50[i]<=0.001;
+  const buf=0.0005;
+
+  const up = e20[i]>e50[i] && slope50>0;
+  const down = e20[i]<e50[i] && slope50<0;
+
+  if(up && (near(k.l) || k.l<=e50[i]) && k.c>e50[i] && k.c>k.o && lowWick>=body){
+    const entry=k.c, stop=k.l*(1-buf), dist=entry-stop;
+    return {side:"BUY",entry,stop,tps:targets("BUY",entry,dist,SNIPER_MULTS),rrs:["1:2","1:3","1:5"],note:"Uptrend pullback to 50 EMA",units:riskAmt/dist};
+  }
+  if(down && (near(k.h) || k.h>=e50[i]) && k.c<e50[i] && k.c<k.o && upWick>=body){
+    const entry=k.c, stop=k.h*(1+buf), dist=stop-entry;
+    return {side:"SELL",entry,stop,tps:targets("SELL",entry,dist,SNIPER_MULTS),rrs:["1:2","1:3","1:5"],note:"Downtrend pullback to 50 EMA",units:riskAmt/dist};
+  }
+  return null;
+}
+
+function card(pair, sig, tag, a) {
+  const third = Math.round(sig.units/3);
+  const tpLines = sig.tps.map((t,i)=>`Profit ${i+1}: ${t.toFixed(5)} (${sig.rrs[i]})`).join("<br>");
+  return `<div class="card"><b>${pair}</b> <span class="${sig.side.toLowerCase()}">${sig.side}</span><span class="tag">${tag}</span><br>${sig.note}<br>Entry: ${sig.entry.toFixed(5)}<br>Stop: ${sig.stop.toFixed(5)}<br>${tpLines}<br>Size: ${sig.units.toFixed(0)} units (close about ${third} at each profit level)<br><span class="muted">After Profit 1, move stop to entry. ADX ${a.toFixed(1)}</span></div>`;
+}
+
+async function scan() {
+  const key=document.getElementById("key").value.trim();
+  const mode=document.getElementById("mode").value;
+  const tf=document.getElementById("tf").value;
+  const acct=+document.getElementById("acct").value;
+  const risk=+document.getElementById("risk").value/100;
+  const out=document.getElementById("out");
+  if(!key){ out.innerHTML='<div class="card">Please paste your API key first.</div>'; return; }
+  out.innerHTML='<div class="card">Scanning... this takes a minute because of the free data limit.</div>';
+  let html="";
+  const riskAmt=acct*risk;
+  for(const p of PAIRS){
+    try{
+      const c=await getCandles(p,tf,key);
+      const a=adx(c);
+      let found=false;
+      if((mode==="both"||mode==="sr") && a<=25){
+        const s=srSignal(c,riskAmt);
+        if(s){ html+=card(p,s,"S/R Bounce",a); found=true; }
+      }
+      if((mode==="both"||mode==="sniper") && a>25){
+        const s=sniperSignal(c,riskAmt);
+        if(s){ html+=card(p,s,"Swing Sniper",a); found=true; }
+      }
+      if(!found){
+        const state = a>25 ? "Trending" : "Ranging";
+        html+=`<div class="card"><b>${p}</b><br><span class="muted">No setup right now. ${state} (ADX ${a.toFixed(1)})</span></div>`;
+      }
+    } catch(e){
+      html+=`<div class="card"><b>${p}</b><br><span class="muted">Error: ${e.message}</span></div>`;
+    }
+    await new Promise(r=>setTimeout(r,8000)); // free API rate limit
+  }
+  out.innerHTML=html;
+}
+</script>
+</body>
+    </html>
